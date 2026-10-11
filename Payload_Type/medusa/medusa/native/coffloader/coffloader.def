@@ -1,0 +1,5 @@
+LIBRARY coffloader
+EXPORTS
+    RunCOFF
+    BeaconGetOutputData
+    BeaconFreeOutputData

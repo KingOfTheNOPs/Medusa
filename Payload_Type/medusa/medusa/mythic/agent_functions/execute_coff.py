@@ -122,6 +122,11 @@ class ExecuteCoffCommand(CommandBase):
         taskData.args.add_arg("packed_arguments", base64.b64encode(packed).decode("ascii"), parameter_group_info=group_info)
 
         helper_path = pathlib.Path(self.agent_code_path).parent / "native" / "coffloader" / "coffloader.x64.dll"
+        if not helper_path.is_file():
+            return PTTaskCreateTaskingMessageResponse(
+                TaskID=taskData.Task.ID, Success=False,
+                Error="server-side COFF loader is missing; rebuild a Medusa payload to compile it"
+            )
         helper = helper_path.read_bytes()
         helper_response = await SendMythicRPCFileCreate(MythicRPCFileCreateMessage(
             TaskID=taskData.Task.ID,

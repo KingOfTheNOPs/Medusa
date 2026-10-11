@@ -66,6 +66,7 @@ class Medusa(PayloadType):
     agent_code_path = pathlib.Path(".") / "medusa" / "agent_code"
 
     build_steps = [
+        BuildStep(step_name="Building COFF Loader", step_description="Cross-compiling the staged x64 helper from source"),
         BuildStep(step_name="Gathering Files", step_description="Creating script payload"),
         BuildStep(step_name="Obfuscating Script", step_description="Encoding and encrypting script content")
     ]
@@ -224,12 +225,50 @@ class Medusa(PayloadType):
                 base_code = base_code.replace(placeholder, self._to_python_literal(value))
         return base_code
 
+    async def _build_coffloader(self):
+        native_dir = self.agent_code_path.parent / "native" / "coffloader"
+        output = native_dir / "coffloader.x64.dll"
+        descriptor, temporary_name = tempfile.mkstemp(dir=str(native_dir), prefix=".coffloader.", suffix=".tmp.dll")
+        os.close(descriptor)
+        temporary_output = pathlib.Path(temporary_name)
+        compiler = os.environ.get("MEDUSA_COFF_COMPILER", "x86_64-w64-mingw32-gcc")
+        command = [
+            compiler, "-O2", "-Wall", "-shared", "-static-libgcc", "-s",
+            "-Wl,--no-insert-timestamp",
+            str(native_dir / "beacon_compatibility.c"), str(native_dir / "COFFLoader.c"),
+            str(native_dir / "coffloader.def"),
+            "-o", str(temporary_output),
+        ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            if process.returncode != 0 or not temporary_output.is_file():
+                raise RuntimeError("MinGW COFF loader build failed: {}".format(stderr.decode("utf-8", "replace")))
+            os.replace(str(temporary_output), str(output))
+            return "Built {} (sha256 {})\n{}".format(
+                output.name, hashlib.sha256(output.read_bytes()).hexdigest(), stdout.decode("utf-8", "replace")
+            )
+        finally:
+            try:
+                temporary_output.unlink()
+            except FileNotFoundError:
+                pass
+
     async def build(self) -> BuildResponse:
         # this function gets called to create an instance of your payload
         resp = BuildResponse(status=BuildStatus.Success)
         # create the payload
         build_msg = ""
         try:
+            coff_build = await self._build_coffloader()
+            await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                PayloadUUID=self.uuid,
+                StepName="Building COFF Loader",
+                StepStdout=coff_build,
+                StepSuccess=True
+            ))
             command_code = ""
             for cmd in self.commands.get_commands():
                 command_path = self.getPythonVersionFile(self.agent_code_path, cmd)
